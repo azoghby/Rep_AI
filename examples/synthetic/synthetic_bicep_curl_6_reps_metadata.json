@@ -1,0 +1,11 @@
+{
+  "csv_filename": "synthetic_bicep_curl_6_reps.csv",
+  "exercise_name": "synthetic_bicep_curl",
+  "muscle": "bicep",
+  "side": "right",
+  "weight": "synthetic demo load",
+  "expected_reps": "6",
+  "data_type": "synthetic",
+  "test_type": "workout_set",
+  "notes": "Synthetic public replay example generated from mathematical pulses; not physiological or copied from a private recording."
+}
