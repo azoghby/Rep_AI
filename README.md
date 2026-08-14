@@ -123,7 +123,7 @@ The synthetic replay smoke test is expected to load the public CSV, read replay 
 
 ## Electrical Safety
 
-Electrical safety matters. Use battery-powered or properly isolated hardware for body-connected sensor work, follow the sensor manufacturer's documentation, avoid unsafe mains-powered setups, and stop immediately if anything feels painful, hot, unstable, or abnormal. RepAI is an experimental personal prototype, not medical equipment.
+Use battery-powered or properly isolated hardware for body-connected sensor work, follow the sensor manufacturer's documentation, avoid unsafe mains-powered setups, and stop immediately if anything feels painful, hot, unstable, or abnormal. RepAI is an experimental personal prototype, not medical equipment.
 
 ## Limitations
 
