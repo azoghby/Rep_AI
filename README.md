@@ -1,12 +1,23 @@
 # RepAI
 
-EMG-powered workout analysis that detects reps, automatically recognizes set completion, and analyzes muscle-activation patterns.
+EMG-powered workout analysis that detects reps, infers likely set completion from sustained low EMG activity, and analyzes muscle-activation patterns.
 
-RepAI is a v0.1 research prototype. It is a student engineering project, not a medical device, clinical tool, or validated strength assessment system. Public examples in this repository are synthetic so reviewers can run the workflow without private recordings.
+RepAI is a v0.2 research prototype. It is a student engineering project, not a medical device, clinical tool, or validated strength assessment system. Public examples in this repository are synthetic so reviewers can run the workflow without private recordings.
 
 ## Demo / What RepAI Does
 
-RepAI reads MyoWare-style EMG samples from Arduino serial hardware or a replay CSV, smooths the signal, detects contraction cycles, and writes set summaries, plots, and local reports. The Streamlit app supports signal checks, recording/replay, real-time set lifecycle state, protocol capture, Dataset Builder review, detector comparison, and activation comparison workflows.
+RepAI reads MyoWare-style EMG samples from Arduino serial hardware or a replay CSV, smooths and calibrates the signal, detects contraction cycles, and writes set summaries, plots, and local reports. The Streamlit app supports signal checks, recording/replay, real-time set lifecycle state, likely set-completion inference from sustained inactivity, protocol capture, Dataset Builder review, detector comparison, and activation comparison workflows.
+
+The current public codebase demonstrates:
+
+- EMG acquisition from Arduino serial hardware or replay CSVs.
+- Calibration-aware signal normalization.
+- Rule-based hybrid repetition detection for production/live analysis.
+- Real-time workout-set lifecycle management with conservative auto-finish behavior.
+- Immediate workout metrics, rep plots, summaries, and report generation.
+- Human annotation and Dataset Builder workflows for boundary review.
+- Leakage-safe candidate-boundary ML evaluation with logistic regression and gradient boosting.
+- Calibration-aware activation and exercise/set comparison analytics.
 
 To try it without hardware, use the included deterministic synthetic fixture:
 
@@ -61,7 +72,7 @@ flowchart LR
 
 ## Hybrid Rep Detection
 
-Current production rep detection is a rule-based hybrid detector in `python/detect_reps.py`. It combines broad activity-region detection with valley candidates, contraction evidence, cadence estimates, and global sequence selection. This is designed for EMG shapes where simple threshold crossings can merge reps during sustained tension.
+Current production/live rep inference uses the rule-based hybrid detector in `python/detect_reps.py`. It combines broad activity-region detection with valley candidates, contraction evidence, cadence estimates, and global sequence selection. This is designed for EMG shapes where simple threshold crossings can merge reps during sustained tension.
 
 The repository still includes the simpler legacy threshold detector for comparison and regression coverage.
 
@@ -74,7 +85,7 @@ The repository contains a leakage-safe candidate-boundary classifier training an
 - `python/boundary_dataset_splits.py` groups splits by session or participant to avoid train/test leakage.
 - `python/boundary_classifier.py` trains and evaluates candidate-boundary classifiers.
 
-The learned model is infrastructure for future work. It is not claimed to be production-ready or superior to the rule-based detector.
+The learned model is infrastructure for future work. It is not deployed into live inference, and it is not claimed to be production-ready or generally superior to the rule-based detector.
 
 ## Activation / Exercise / Side Analytics
 
@@ -84,7 +95,7 @@ Normalized EMG uses a calibration reference. Values can exceed 100% when a worko
 
 ## Dataset Builder and Human Verification
 
-The Dataset Builder workflow creates local manifests and annotation files for candidate-boundary review. Public releases must not include real session annotations or private recordings. The code is included so reviewers can inspect the architecture and run synthetic tests; generated `datasets/` content is ignored by Git.
+The Dataset Builder workflow creates local manifests and annotation files for candidate-boundary review. It supports human-verified labels; detector-generated boundaries are not treated as automatic ground truth. Public releases must not include real session annotations or private recordings. The code is included so reviewers can inspect the architecture and run synthetic tests; generated `datasets/` content is ignored by Git.
 
 ## Testing and Validation
 
@@ -101,7 +112,7 @@ Coverage includes acquisition replay, serial parsing, calibration selection, set
 
 ```bash
 git clone https://github.com/azoghby/Rep_AI.git
-cd RepAI-Public
+cd Rep_AI
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -110,6 +121,17 @@ python -m streamlit run app/streamlit_app.py
 ```
 
 For wired hardware, upload `arduino/myoware_reader/myoware_reader.ino`, select the serial source in the app, run a signal check, then record a set.
+
+Useful command-line checks:
+
+```bash
+python tests/smoke_public.py
+python -m pytest -q
+python python/activation_comparisons.py examples/synthetic/synthetic_bicep_curl_6_reps.csv --detector-method hybrid
+python python/run_boundary_classifier_experiment.py --help
+```
+
+The boundary-classifier experiment expects a labeled `datasets/boundary_candidates.csv` generated locally by the Dataset Builder/export workflow. Real annotated Dataset Builder sessions are intentionally not included in the public repository.
 
 ## Repository Structure
 
@@ -129,7 +151,7 @@ reports/              Local generated HTML reports, ignored by Git.
 
 ## Current Limitations
 
-- v0.1 research prototype, not clinically validated.
+- v0.2 research prototype, not clinically validated.
 - Single-sensor side comparisons are sequential and sensitive to electrode placement, fatigue, timing, and skin contact.
 - Rep boundaries can be interpretive, especially with sustained tension, partial relaxation, or pauses.
 - Normalized activation depends on calibration quality and should not be treated as an absolute physiological measure.
