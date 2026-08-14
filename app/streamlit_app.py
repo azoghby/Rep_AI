@@ -19,12 +19,14 @@ from summary_reader import (
     appears_derived_or_trimmed,
     appears_diagnostic,
     calibration_recordings,
+    compatible_calibration_recordings,
     comparison_mentions_file,
     current_graph_path_for_csv,
     current_summary_path_for_csv,
     graph_path_for_csv,
     latest_comparison,
     load_calibration_from_csv_name,
+    load_compatible_current_calibration,
     load_current_calibration,
     output_is_current,
     recording_summary,
@@ -36,28 +38,47 @@ from summary_reader import (
 BASE_DIR = Path(__file__).resolve().parent.parent
 PYTHON_DIR = BASE_DIR / "python"
 DATA_DIR = BASE_DIR / "data"
-SYNTHETIC_EXAMPLES_DIR = BASE_DIR / "examples" / "synthetic"
 
 if str(PYTHON_DIR) not in sys.path:
     sys.path.insert(0, str(PYTHON_DIR))
 
 from acquisition import ReplaySignalSource, SerialSignalSource, available_serial_ports  # noqa: E402
 from compare_latest_sets import main as refresh_latest_comparison  # noqa: E402
+from dataset_builder import (  # noqa: E402
+    annotation_figure,
+    create_session_manifest,
+    list_dataset_sessions,
+    load_annotations,
+    new_session_id,
+    planned_cue_schedule,
+    planned_total_duration,
+    recording_duration,
+    resolve_repo_path,
+    save_annotations,
+    save_dataset_session,
+    validate_annotation_rows,
+)
 from detect_reps import (  # noqa: E402
-    BASELINE_PERCENTILE,
-    END_THRESHOLD_FRACTION,
     SMOOTHING_WINDOW,
-    START_THRESHOLD_FRACTION,
     activation_change_phrase,
     analyze_csv_file,
     detect_reps,
     detect_reps_hybrid,
-    low_percentile_average,
+    detector_threshold_values,
     moving_average,
     read_signal,
 )
 from generate_report import main as regenerate_reports  # noqa: E402
 from recording_metadata import load_metadata, save_metadata  # noqa: E402
+from recording_metadata import metadata_path_for_csv  # noqa: E402
+from set_lifecycle import (  # noqa: E402
+    SetLifecycle,
+    SetLifecycleConfig,
+    SetSessionSpec,
+    SetState,
+    run_once_for_completed_set,
+    write_recording_atomic,
+)
 
 
 PREFLIGHT_ITEMS = [
@@ -89,18 +110,9 @@ def selected_csv(csv_name):
     return BASE_DIR / "data" / csv_name if csv_name else None
 
 
-def replay_recordings():
-    recordings = valid_workout_recordings()
-
-    if SYNTHETIC_EXAMPLES_DIR.exists():
-        recordings.extend(sorted(SYNTHETIC_EXAMPLES_DIR.glob("*.csv")))
-
-    return recordings
-
-
 def detector_comparison_recordings():
     recordings = valid_workout_recordings()
-    diagnostic_dir = DATA_DIR / "diagnostic_recordings"
+    diagnostic_dir = DATA_DIR / "diagnostics"
 
     if diagnostic_dir.exists():
         recordings.extend(sorted(diagnostic_dir.glob("*.csv"), key=lambda path: path.stat().st_mtime, reverse=True))
@@ -138,11 +150,9 @@ def detected_reps_from_result(result):
 def detector_thresholds(csv_file):
     times, values = read_signal(csv_file)
     smoothed_values = moving_average(values, SMOOTHING_WINDOW)
-    baseline = low_percentile_average(smoothed_values, BASELINE_PERCENTILE)
-    max_signal = max(smoothed_values)
-    signal_range = max_signal - baseline
-    start_threshold = baseline + START_THRESHOLD_FRACTION * signal_range
-    end_threshold = baseline + END_THRESHOLD_FRACTION * signal_range
+    thresholds = detector_threshold_values(times, smoothed_values, values)
+    start_threshold = thresholds["start_threshold"]
+    end_threshold = thresholds["end_threshold"]
     return times, values, smoothed_values, start_threshold, end_threshold
 
 
@@ -177,6 +187,35 @@ def detector_result_without_writing(csv_file, method):
         "graph_file": graph_file,
         "diagnostics": diagnostics,
         "method": method,
+    }
+
+
+def detector_result_for_samples(samples):
+    if len(samples) < 3:
+        return {"summary": {"total_reps": 0}, "reps": []}
+
+    times = [sample.time_ms / 1000 for sample in samples]
+    values = [sample.emg_value for sample in samples]
+    smoothed_values = moving_average(values, SMOOTHING_WINDOW)
+    thresholds = detector_threshold_values(times, smoothed_values, values)
+    signal_range = thresholds["signal_range"]
+
+    if signal_range <= 0:
+        return {"summary": {"total_reps": 0}, "reps": []}
+
+    start_threshold = thresholds["start_threshold"]
+    end_threshold = thresholds["end_threshold"]
+    reps, diagnostics = detect_reps_hybrid(
+        times,
+        values,
+        smoothed_values,
+        start_threshold,
+        end_threshold,
+    )
+    return {
+        "summary": {"total_reps": len(reps)},
+        "reps": reps,
+        "diagnostics": diagnostics,
     }
 
 
@@ -289,60 +328,6 @@ def source_from_selection(source_type, port=None, replay_csv=None, replay_realti
         return ReplaySignalSource(replay_csv, realtime=replay_realtime)
 
     return SerialSignalSource(port)
-
-
-def replay_source_stats(csv_file):
-    times, _ = read_signal(csv_file)
-    source_duration = (times[-1] - times[0]) if len(times) >= 2 else 0
-    return {
-        "expected_samples": len(times),
-        "source_duration": source_duration,
-    }
-
-
-def run_replay_workflow(replay_csv, replay_realtime=False, progress_callback=None, status_callback=None):
-    replay_csv = Path(replay_csv)
-    stats = replay_source_stats(replay_csv)
-    source = ReplaySignalSource(replay_csv, realtime=replay_realtime)
-    readings = []
-    malformed_reads = 0
-
-    if status_callback:
-        status_callback("Replay starting...")
-
-    source.connect()
-    try:
-        while True:
-            reading = source.read()
-            if reading is None:
-                break
-
-            readings.append(reading)
-
-            if progress_callback:
-                progress_callback(
-                    min(1.0, len(readings) / max(1, stats["expected_samples"]))
-                )
-
-            if replay_realtime and status_callback:
-                status_callback(f"Playback active: {len(readings)} samples read")
-    finally:
-        source.disconnect()
-
-    if progress_callback:
-        progress_callback(1.0)
-
-    legacy_result = analyze_csv_file(replay_csv, show_plot=False, method="legacy")
-    hybrid_result = analyze_csv_file(replay_csv, show_plot=False, method="hybrid")
-
-    return {
-        "source_csv": replay_csv,
-        "samples_read": len(readings),
-        "malformed_samples": malformed_reads,
-        "source_duration": stats["source_duration"],
-        "legacy_result": legacy_result,
-        "hybrid_result": hybrid_result,
-    }
 
 
 def collect_readings(source, duration_seconds):
@@ -483,6 +468,63 @@ def write_workout_recording(source, output_file, metadata, duration_seconds, pro
     }
 
 
+def write_dataset_recording(source, output_file, metadata, duration_seconds, cue_schedule, progress_bar):
+    readings = []
+    malformed_reads = 0
+    deadline = time.monotonic() + duration_seconds
+    phase_placeholder = st.empty()
+    source.connect()
+
+    try:
+        metadata_file = save_metadata(output_file, metadata)
+
+        with open(output_file, "w", newline="") as file:
+            writer = csv.writer(file)
+            writer.writerow(["time_ms", "host_time_ms", "emg_value"])
+            first_host_time_ms = None
+
+            while time.monotonic() < deadline:
+                elapsed_seconds = duration_seconds - (deadline - time.monotonic())
+                progress_bar.progress(min(1.0, elapsed_seconds / duration_seconds))
+                active_cue = next(
+                    (
+                        cue for cue in cue_schedule
+                        if cue["start_time"] <= elapsed_seconds < cue["end_time"]
+                    ),
+                    None,
+                )
+                if active_cue:
+                    phase_placeholder.info(
+                        f"Rep {active_cue['rep']} - {active_cue['phase'].title()}"
+                    )
+                else:
+                    phase_placeholder.info("Recording")
+
+                reading = source.read()
+
+                if reading is None:
+                    malformed_reads += 1
+                    continue
+
+                if first_host_time_ms is None:
+                    first_host_time_ms = reading.host_time_ms
+
+                elapsed_ms = reading.host_time_ms - first_host_time_ms
+                writer.writerow([elapsed_ms, reading.host_time_ms, reading.signal_value])
+                readings.append(reading)
+    finally:
+        source.disconnect()
+        progress_bar.progress(1.0)
+        phase_placeholder.empty()
+
+    return {
+        "csv_file": output_file,
+        "metadata_file": metadata_file,
+        "readings": readings,
+        "malformed_reads": malformed_reads,
+    }
+
+
 def run_post_recording_pipeline(csv_file):
     legacy_result = analyze_csv_file(csv_file, show_plot=False, method="legacy")
     comparison_error = None
@@ -513,6 +555,11 @@ def show_calibration():
         ("Source", calibration.get("source_csv", "")),
         ("Muscle", source_metadata.get("muscle", "")),
         ("Side", source_metadata.get("side", "")),
+    ])
+    metric_row([
+        ("Setup ID", source_metadata.get("calibration_setup_id", "")),
+        ("Recorded", source_metadata.get("timestamp", "")),
+        ("Gain note", "Recalibrate after MyoWare ENV gain changes."),
     ])
     metric_row([
         ("Baseline", f"{calibration.get('baseline', 0):.1f}"),
@@ -710,8 +757,77 @@ def show_preflight():
     )
 
 
+def active_set_is_running():
+    lifecycle = st.session_state.get("workout_set_lifecycle")
+    return lifecycle is not None and lifecycle.state in {
+        SetState.COUNTDOWN,
+        SetState.RECORDING,
+        SetState.POSSIBLE_END,
+        SetState.ANALYZING,
+    }
+
+
+WORKOUT_REPLAY_METADATA_FIELDS = {
+    "workout_exercise": ("exercise_name", "exercise"),
+    "workout_muscle": ("muscle",),
+    "workout_side": ("side",),
+    "workout_weight": ("weight",),
+    "workout_expected_reps": ("planned_reps", "expected_reps"),
+    "workout_calibration_csv": ("calibration_csv", "calibration_source_csv", "source_csv"),
+}
+
+
+def replay_metadata_defaults(replay_csv):
+    if replay_csv is None:
+        return {}
+
+    metadata = load_metadata(Path(replay_csv))
+    defaults = {}
+
+    for widget_key, metadata_keys in WORKOUT_REPLAY_METADATA_FIELDS.items():
+        for metadata_key in metadata_keys:
+            value = metadata.get(metadata_key)
+            if value not in ("", None):
+                defaults[widget_key] = str(value)
+                break
+
+    defaults.setdefault("workout_exercise", Path(replay_csv).stem)
+    return defaults
+
+
+def sync_replay_metadata_to_state(state, replay_csv, ready=True):
+    if not ready or replay_csv is None:
+        return False
+
+    replay_path = str(Path(replay_csv).resolve())
+    if state.get("workout_replay_metadata_source") == replay_path:
+        return False
+
+    for key, value in replay_metadata_defaults(replay_csv).items():
+        state[key] = value
+
+    state["workout_replay_metadata_source"] = replay_path
+    return True
+
+
+def clear_replay_metadata_source_marker(state):
+    state.pop("workout_replay_metadata_source", None)
+
+
 def show_source_controls(collection_enabled):
     st.subheader("Connection")
+
+    lifecycle = st.session_state.get("workout_set_lifecycle")
+    if active_set_is_running() and lifecycle.active_spec is not None:
+        spec = lifecycle.active_spec
+        st.info(f"Active set source is locked: {spec.source_label}")
+        status = st.session_state.get("connection_status", "Disconnected")
+        if status.startswith("Error:"):
+            st.error(status)
+        else:
+            st.info(status)
+        return spec.source_type, spec.port, spec.replay_csv, spec.replay_realtime
+
     source_type = st.radio(
         "Signal source",
         ["Serial hardware", "Replay CSV"],
@@ -769,18 +885,18 @@ def show_source_controls(collection_enabled):
                 st.session_state.connection_status = f"Error: {error}"
 
     else:
-        st.subheader("Replay a saved recording")
-        replay_files = replay_recordings()
+        replay_files = valid_workout_recordings()
         if replay_files:
             selected_name = st.selectbox(
-                "Saved recording",
-                [str(file.relative_to(BASE_DIR)) for file in replay_files],
+                "Replay recording",
+                [file.name for file in replay_files],
                 key="workout_replay_recording",
             )
-            replay_csv = next(
-                file
-                for file in replay_files
-                if str(file.relative_to(BASE_DIR)) == selected_name
+            replay_csv = next(file for file in replay_files if file.name == selected_name)
+            sync_replay_metadata_to_state(
+                st.session_state,
+                replay_csv,
+                ready=not active_set_is_running(),
             )
             replay_realtime = st.checkbox(
                 "Replay with original timing",
@@ -796,72 +912,6 @@ def show_source_controls(collection_enabled):
         st.info(status)
 
     return source_type, port, replay_csv, replay_realtime
-
-
-def show_replay_result(result):
-    st.success("Replay complete")
-    metric_row([
-        ("Source filename", result["source_csv"].name),
-        ("Samples read", result["samples_read"]),
-        ("Malformed samples skipped", result["malformed_samples"]),
-    ])
-    metric_row([
-        ("Source duration", f"{result['source_duration']:.2f}s"),
-        ("Legacy detected reps", result["legacy_result"]["summary"]["total_reps"]),
-        ("Hybrid detected reps", result["hybrid_result"]["summary"]["total_reps"]),
-    ])
-
-    st.markdown("**Generated summaries**")
-    st.write(str(result["legacy_result"]["summary_file"].relative_to(BASE_DIR)))
-    st.write(str(result["hybrid_result"]["summary_file"].relative_to(BASE_DIR)))
-
-    graph_columns = st.columns(2)
-    with graph_columns[0]:
-        st.markdown("**Legacy graph**")
-        st.image(
-            str(result["legacy_result"]["graph_file"]),
-            caption=result["legacy_result"]["graph_file"].name,
-            use_container_width=True,
-        )
-    with graph_columns[1]:
-        st.markdown("**Hybrid graph**")
-        st.image(
-            str(result["hybrid_result"]["graph_file"]),
-            caption=result["hybrid_result"]["graph_file"].name,
-            use_container_width=True,
-        )
-
-
-def show_replay_workflow(replay_csv, replay_realtime):
-    replay_disabled = replay_csv is None
-
-    if st.button(
-        "Start replay",
-        disabled=replay_disabled,
-        key="workout_start_replay",
-        type="primary",
-    ):
-        progress_bar = st.progress(0.0)
-        status = st.empty()
-        status.info("Replay starting...")
-
-        try:
-            with st.spinner("Running replay..."):
-                result = run_replay_workflow(
-                    replay_csv,
-                    replay_realtime=replay_realtime,
-                    progress_callback=progress_bar.progress,
-                    status_callback=status.info,
-                )
-        except Exception as error:  # noqa: BLE001
-            st.exception(error)
-            return
-
-        st.session_state.replay_result = result
-
-    replay_result = st.session_state.get("replay_result")
-    if replay_result:
-        show_replay_result(replay_result)
 
 
 def show_signal_check(collection_enabled, source_type, port, replay_csv, replay_realtime):
@@ -920,135 +970,529 @@ def show_signal_check(collection_enabled, source_type, port, replay_csv, replay_
         plt.close(figure)
 
 
-def show_workout_recording(collection_enabled, source_type, port, replay_csv, replay_realtime):
-    st.subheader("Timed Workout Recording")
-    missing_source = source_type == "Serial hardware" and port is None
-    missing_source = missing_source or (source_type == "Replay CSV" and replay_csv is None)
+def workout_lifecycle():
+    lifecycle = st.session_state.get("workout_set_lifecycle")
 
-    with st.form("workout_recording_form"):
-        exercise = st.text_input("Exercise", value="synthetic_bicep_curl", key="workout_exercise")
-        muscle = st.text_input("Muscle", value="bicep", key="workout_muscle")
-        side = st.text_input("Side", value="right", key="workout_side")
-        weight = st.text_input("Weight", value="3", key="workout_weight")
-        expected_reps = st.text_input("Expected reps", value="6", key="workout_expected_reps")
-        notes = st.text_area("Notes", value="", key="workout_notes")
-        duration = st.number_input(
-            "Recording duration (seconds)",
-            min_value=5,
-            max_value=180,
-            value=45,
-            step=5,
-            key="workout_duration",
-        )
-        submitted = st.form_submit_button(
-            "Start Recording",
-            disabled=not collection_enabled or missing_source,
-        )
+    if lifecycle is None:
+        lifecycle = SetLifecycle(config=SetLifecycleConfig())
+        st.session_state.workout_set_lifecycle = lifecycle
 
-    if not submitted:
+    return lifecycle
+
+
+def close_workout_source():
+    source = st.session_state.get("workout_set_source")
+    if source is None:
         return
 
-    DATA_DIR.mkdir(exist_ok=True)
+    try:
+        source.disconnect()
+    except Exception:  # noqa: BLE001
+        pass
+
+    st.session_state.workout_set_source = None
+
+
+def workout_setup_payload():
+    return {
+        "exercise": st.session_state.get("workout_exercise", "workout_set").strip() or "workout_set",
+        "muscle": st.session_state.get("workout_muscle", "").strip(),
+        "side": st.session_state.get("workout_side", "").strip(),
+        "weight": st.session_state.get("workout_weight", "").strip(),
+        "planned_reps": str(st.session_state.get("workout_expected_reps", "")).strip(),
+        "participant_id": st.session_state.get("workout_participant_id", "").strip(),
+        "comparison_target": st.session_state.get("workout_comparison_target", "").strip(),
+        "notes": st.session_state.get("workout_notes", "").strip(),
+        "calibration_csv": st.session_state.get("workout_calibration_csv", "").strip(),
+        "calibration_setup_id": st.session_state.get("workout_calibration_setup_id", "").strip(),
+    }
+
+
+def replay_source_metadata(source_type, replay_csv):
+    if source_type != "Replay CSV" or replay_csv is None:
+        return {
+            "source_replay_csv": "",
+            "source_replay_filename": "",
+        }
+
+    return {
+        "source_replay_csv": str(replay_csv.resolve()),
+        "source_replay_filename": replay_csv.name,
+    }
+
+
+def build_workout_session_spec(source_type, port, replay_csv, replay_realtime):
+    payload = workout_setup_payload()
     timestamp = datetime.now()
-    output_file = unique_recording_path(exercise, timestamp)
+    output_file = unique_recording_path(payload["exercise"], timestamp)
     metadata = {
-        "exercise_name": exercise.strip() or "workout_set",
-        "muscle": muscle.strip(),
-        "side": side.strip(),
-        "weight": weight.strip(),
-        "expected_reps": expected_reps.strip(),
-        "data_type": "synthetic" if source_type == "Replay CSV" else "real",
+        "session_id": f"workout_{timestamp.strftime('%Y%m%d_%H%M%S')}",
+        "participant_id": payload["participant_id"],
+        "exercise_name": payload["exercise"],
+        "muscle": payload["muscle"],
+        "side": payload["side"],
+        "weight": payload["weight"],
+        "expected_reps": payload["planned_reps"],
+        "planned_reps": payload["planned_reps"],
+        "comparison_target": payload["comparison_target"],
+        "calibration_csv": payload["calibration_csv"],
+        "calibration_setup_id": payload["calibration_setup_id"],
+        "source_type": source_type,
+        "data_type": "real",
         "test_type": "workout_set",
-        "notes": notes.strip(),
+        "set_end_rule": "sustained_low_emg_activity",
+        "notes": payload["notes"],
         "csv_filename": output_file.name,
         "timestamp": timestamp.isoformat(timespec="seconds"),
     }
-    source = source_from_selection(source_type, port, replay_csv, replay_realtime)
-    progress_bar = st.progress(0.0)
+    metadata.update(replay_source_metadata(source_type, replay_csv))
+    return SetSessionSpec(
+        source_type=source_type,
+        port=port,
+        replay_csv=Path(replay_csv) if replay_csv is not None else None,
+        replay_realtime=replay_realtime,
+        output_file=output_file,
+        metadata_file=metadata_path_for_csv(output_file),
+        metadata=metadata,
+    )
 
-    with st.spinner("Recording workout set..."):
-        try:
-            recording = write_workout_recording(
-                source,
-                output_file,
-                metadata,
-                duration,
-                progress_bar,
-            )
-        except Exception as error:  # noqa: BLE001
-            st.error(f"Recording failed: {error}")
-            return
 
-    st.success(f"Saved recording: {recording['csv_file'].resolve()}")
-    st.write(f"Saved metadata: {recording['metadata_file'].resolve()}")
+def compatible_previous_recording(current_csv, metadata):
+    candidates = []
 
-    if recording["malformed_reads"]:
-        st.warning(f"Skipped {recording['malformed_reads']} malformed or empty readings.")
+    for recording in valid_workout_recordings():
+        if recording == current_csv:
+            continue
 
-    if not recording["readings"]:
-        st.error("No valid readings were saved, so analysis was skipped.")
-        return
+        candidate_metadata = load_metadata(recording)
+        compatible = all(
+            str(candidate_metadata.get(key, "")).strip().lower()
+            == str(metadata.get(key, "")).strip().lower()
+            for key in ("exercise_name", "side", "weight")
+        )
 
-    with st.spinner("Analyzing recording and refreshing reports..."):
-        try:
-            legacy_result, hybrid_result, comparison_error = run_post_recording_pipeline(output_file)
-        except Exception as error:  # noqa: BLE001
-            st.error(f"Post-recording analysis failed: {error}")
-            return
+        if compatible:
+            candidates.append(recording)
 
-    st.session_state.latest_recorded_csv = output_file
-    summary = legacy_result["summary"]
-    detected_reps = summary["total_reps"]
+    return candidates[0] if candidates else None
 
-    if expected_reps_differ(expected_reps, detected_reps):
-        st.warning("Expected reps and detected reps differ.")
+
+def build_completed_set_dataset_manifest(csv_file, metadata, analysis_result):
+    created_at = datetime.now()
+    session_id = new_session_id(
+        metadata.get("participant_id", "") or "workout",
+        metadata.get("exercise_name", "") or "workout_set",
+        created_at=created_at,
+    )
+    exercise_metadata = {
+        "exercise": metadata.get("exercise_name", ""),
+        "muscle": metadata.get("muscle", ""),
+        "side": metadata.get("side", ""),
+        "weight": metadata.get("weight", ""),
+        "body_position": metadata.get("body_position", ""),
+        "grip": metadata.get("grip", ""),
+        "placement_id": metadata.get("placement_id", ""),
+    }
+    cue_schedule = []
+    calibration_csv = metadata.get("calibration_csv", "")
+    calibration_path = selected_csv(calibration_csv) if calibration_csv else None
+
+    try:
+        planned_reps = int(metadata.get("expected_reps") or metadata.get("planned_reps") or 0)
+    except (TypeError, ValueError):
+        planned_reps = 0
+
+    manifest = create_session_manifest(
+        session_id=session_id,
+        participant_id=metadata.get("participant_id", "") or "workout",
+        recording_csv=csv_file,
+        calibration_csv=calibration_path,
+        exercise_metadata=exercise_metadata,
+        planned_reps=planned_reps,
+        cadence={},
+        cue_timestamps=cue_schedule,
+        recording_started_at=metadata.get("timestamp", ""),
+        notes=metadata.get("notes", ""),
+    )
+    manifest["source_workout_session_id"] = metadata.get("session_id", "")
+    manifest["workout_detector_outputs"] = {
+        "legacy": (analysis_result.get("legacy") or {}).get("summary", {}),
+        "hybrid": (analysis_result.get("hybrid") or {}).get("summary", {}),
+    }
+    return manifest
+
+
+def completed_set_identity(metadata, csv_file):
+    return {
+        "source_replay_filename": metadata.get("source_replay_filename") or "Not replay",
+        "output_recording_filename": Path(csv_file).name,
+        "exercise": metadata.get("exercise_name", ""),
+        "side": metadata.get("side", ""),
+        "weight": metadata.get("weight", ""),
+    }
+
+
+def render_completed_set_results(lifecycle):
+    analysis_result = lifecycle.analysis_result or {}
+    csv_file = Path(analysis_result.get("csv_file", lifecycle.output_file))
+    metadata = analysis_result.get("metadata") or load_metadata(csv_file)
+    legacy_result = analysis_result.get("legacy")
+    hybrid_result = analysis_result.get("hybrid")
+    comparison_error = analysis_result.get("comparison_error")
+    summary = (hybrid_result or legacy_result)["summary"]
+    legacy_summary = (legacy_result or {}).get("summary", {})
+    has_calibration = summary.get("has_calibration", False)
+    identity = completed_set_identity(metadata, csv_file)
+
+    st.subheader("Set Results")
+    st.caption(
+        "Hybrid rep detection is experimental. Set completion is inferred from sustained low EMG activity, "
+        "not from detecting that the weight was physically put down."
+    )
+
+    if not has_calibration:
+        st.warning("Calibration is missing or unusable. Normalized activation uses safe fallback behavior and may be unavailable.")
 
     if comparison_error:
         st.warning(f"Latest compatible comparison was not refreshed: {comparison_error}")
 
-    average_normalized = (
-        f"{summary['normalized_average_rep_activation']:.1f}%"
-        if summary["has_calibration"]
-        else "Not available"
-    )
-    peak_normalized = (
-        f"{summary['normalized_peak_activation']:.1f}%"
-        if summary["has_calibration"]
-        else "Not available"
-    )
-
     metric_row([
-        ("Detected reps", detected_reps),
-        ("Expected reps", expected_reps),
-        ("Avg normalized rep activation", average_normalized),
+        ("Hybrid reps", summary["total_reps"]),
+        ("Legacy reps", legacy_summary.get("total_reps", "Not available")),
+        ("Source replay", identity["source_replay_filename"]),
+        ("Output recording", identity["output_recording_filename"]),
     ])
     metric_row([
-        ("Peak normalized activation", peak_normalized),
+        (
+            "Avg normalized activation",
+            f"{summary['normalized_average_rep_activation']:.1f}%" if has_calibration else "Not available",
+        ),
+        (
+            "Peak normalized activation",
+            f"{summary['normalized_peak_activation']:.1f}%" if has_calibration else "Not available",
+        ),
+        ("Rep duration", f"{summary['average_rep_duration']:.2f}s avg"),
+    ])
+    metric_row([
         ("Activation trend", activation_change_phrase(summary["peak_drop_percent"])),
-        ("Saved graph", legacy_result["graph_file"].name),
+        ("Exercise", identity["exercise"]),
+        ("Side", identity["side"]),
+        ("Weight", identity["weight"]),
+    ])
+    metric_row([
+        ("Planned reps", metadata.get("expected_reps", "")),
+        ("Session ID", metadata.get("session_id", "")),
     ])
 
-    stats = signal_check_stats(recording["readings"])
-    for warning in signal_quality_warnings(stats):
-        st.warning(warning)
+    previous = compatible_previous_recording(csv_file, metadata)
+    if previous:
+        st.markdown("**Immediately previous compatible set**")
+        st.write(previous.name)
+        show_latest_comparison(csv_file)
+    else:
+        st.info("No previous compatible set was found for exercise, side, and weight.")
 
-    st.image(str(legacy_result["graph_file"]), caption=legacy_result["graph_file"].name, use_container_width=True)
-    show_detector_comparison(expected_reps, legacy_result, hybrid_result)
+    if hybrid_result:
+        show_rep_intervals("Hybrid", hybrid_result)
+
+    if legacy_result and legacy_result.get("graph_file") and legacy_result["graph_file"].exists():
+        st.image(str(legacy_result["graph_file"]), caption=legacy_result["graph_file"].name, use_container_width=True)
+
+    if st.button("Add this set to Dataset Builder", key=f"dataset_from_set_{csv_file.stem}"):
+        try:
+            manifest = build_completed_set_dataset_manifest(csv_file, metadata, analysis_result)
+            manifest_file, annotation_file = save_dataset_session(manifest)
+        except Exception as error:  # noqa: BLE001
+            st.error(f"Dataset session creation failed: {error}")
+        else:
+            st.success(f"Saved dataset session: {manifest['session_id']}")
+            st.write(f"Manifest: {manifest_file.resolve()}")
+            st.write(f"Annotations: {annotation_file.resolve()}")
+
+    if st.button("Start Next Set", key="workout_start_next_set"):
+        close_workout_source()
+        lifecycle.reset()
+        clear_replay_metadata_source_marker(st.session_state)
+        st.rerun()
+
+
+def analyze_completed_set_once(lifecycle, metadata):
+    if lifecycle.output_file is None:
+        raise ValueError("Completed set is missing an output file.")
+
+    analysis_key = str(lifecycle.output_file.resolve())
+    if lifecycle.write_result is None:
+        if not lifecycle.samples:
+            raise ValueError("No valid readings were captured, so analysis was skipped.")
+        metadata = dict(metadata)
+        metadata["acquisition_diagnostics"] = lifecycle.acquisition_diagnostics()
+        output_file, metadata_file = write_recording_atomic(
+            lifecycle.output_file,
+            lifecycle.metadata_file,
+            metadata,
+            lifecycle.samples,
+        )
+        lifecycle.write_result = {
+            "csv_file": output_file,
+            "metadata_file": metadata_file,
+        }
+
+    def analyze():
+        legacy_result, hybrid_result, comparison_error = run_post_recording_pipeline(lifecycle.output_file)
+        return {
+            "csv_file": lifecycle.output_file,
+            "metadata_file": lifecycle.metadata_file,
+            "metadata": metadata,
+            "legacy": legacy_result,
+            "hybrid": hybrid_result,
+            "comparison_error": comparison_error,
+        }
+
+    return run_once_for_completed_set(lifecycle, analysis_key, analyze)
+
+
+def render_live_recording_controls(lifecycle, source):
+    status = st.session_state.get("workout_set_status", {})
+    elapsed = status.get("elapsed_seconds", 0.0)
+    approx = detector_result_for_samples(lifecycle.samples)
+    auto_stop_armed = status.get("auto_stop_armed", False)
+
+    if lifecycle.state == SetState.POSSIBLE_END:
+        state_label = "Possible End"
+    elif lifecycle.state == SetState.RECORDING and auto_stop_armed:
+        state_label = "Auto-Stop Armed"
+    elif lifecycle.state == SetState.RECORDING:
+        state_label = "Recording"
+    else:
+        state_label = lifecycle.state.value.replace("_", " ").title()
+
+    metric_row([
+        ("State", state_label),
+        ("Elapsed", f"{elapsed:.1f}s"),
+        ("Provisional hybrid reps", approx["summary"]["total_reps"]),
+    ])
+    metric_row([
+        ("Smoothed signal", f"{status.get('smoothed_value', 0):.1f}"),
+        ("Activity threshold", f"{status.get('threshold', 0):.1f}"),
+        ("Activity", "Detected" if status.get("active") else "Low"),
+    ])
+    metric_row([
+        ("Auto-stop", "Armed" if auto_stop_armed else "Not armed"),
+        ("Activity episodes", status.get("substantial_activity_episodes", 0)),
+        ("Active time", f"{status.get('active_duration_seconds', 0.0):.1f}s"),
+    ])
+
+    if lifecycle.state == SetState.RECORDING and not auto_stop_armed:
+        st.info("Auto-stop will arm after a real set pattern is detected.")
+
+    if lifecycle.state == SetState.POSSIBLE_END and lifecycle.inference is not None:
+        inactivity_elapsed = status.get("inactivity_elapsed_seconds", 0.0)
+        remaining = lifecycle.inference.inactivity_remaining_seconds(elapsed)
+        st.warning(
+            "Possible set ending. "
+            f"Low activity for {inactivity_elapsed:.1f}s; "
+            f"auto-finish in about {remaining:.1f}s if low activity continues."
+        )
+
+    timing_warning = status.get("timing_drift_warning")
+    if timing_warning:
+        st.warning(f"Acquisition timing warning: {timing_warning}")
+
+    control_cols = st.columns(2)
+    finish_clicked = control_cols[0].button("Finish Set", key="workout_manual_finish")
+    cancel_clicked = control_cols[1].button("Cancel Set", key="workout_manual_cancel")
+
+    if cancel_clicked:
+        lifecycle.cancel()
+        close_workout_source()
+        st.rerun()
+
+    if finish_clicked:
+        lifecycle.finish()
+        close_workout_source()
+        st.rerun()
+
+    try:
+        if hasattr(source, "read_many"):
+            readings = source.read_many()
+        else:
+            reading = source.read()
+            readings = [reading] if reading is not None else []
+    except Exception as error:  # noqa: BLE001
+        close_workout_source()
+        lifecycle.fail(error)
+        st.rerun()
+
+    if not readings:
+        close_workout_source()
+        if lifecycle.inference and lifecycle.inference.auto_stop_armed:
+            lifecycle.finish()
+        else:
+            lifecycle.cancel("Signal source ended before meaningful contraction activity was observed.")
+        st.rerun()
+
+    for reading in readings:
+        status = lifecycle.observe(reading)
+        st.session_state.workout_set_status = status
+
+        if lifecycle.state == SetState.ANALYZING:
+            break
+
+    if lifecycle.state == SetState.ANALYZING:
+        close_workout_source()
+        st.rerun()
+
+    time.sleep(0.05)
+    st.rerun()
+
+
+def show_workout_recording(collection_enabled, source_type, port, replay_csv, replay_realtime):
+    st.subheader("Real-Time Set")
+    lifecycle = workout_lifecycle()
+    missing_source = source_type == "Serial hardware" and port is None
+    missing_source = missing_source or (source_type == "Replay CSV" and replay_csv is None)
+
+    if lifecycle.state == SetState.READY:
+        with st.form("workout_recording_form"):
+            exercise = st.text_input("Exercise", value="synthetic_bicep_curl", key="workout_exercise")
+            muscle = st.text_input("Muscle", value="bicep", key="workout_muscle")
+            side = st.text_input("Side", value="right", key="workout_side")
+            weight = st.text_input("Weight", value="3", key="workout_weight")
+            expected_reps = st.text_input("Planned reps", value="6", key="workout_expected_reps")
+            participant_id = st.text_input("Participant ID (optional)", value="", key="workout_participant_id")
+            comparison_target = st.text_input("Optional comparison target", value="", key="workout_comparison_target")
+            setup_id = st.text_input(
+                "Sensor setup ID",
+                value=st.session_state.get("workout_calibration_setup_id", ""),
+                key="workout_calibration_setup_id",
+            )
+            notes = st.text_area("Notes", value="", key="workout_notes")
+            compatible_calibrations = compatible_calibration_recordings(muscle, side, setup_id)
+            if not setup_id.strip():
+                st.warning(
+                    "Set a sensor setup ID and record a new calibration whenever MyoWare ENV gain or electrode setup changes."
+                )
+            if compatible_calibrations:
+                st.info(f"Calibration: {compatible_calibrations[0].name}")
+            else:
+                st.warning("A compatible calibration for this muscle and side is required before recording.")
+            submitted = st.form_submit_button(
+                "Start Countdown",
+                disabled=not collection_enabled or missing_source or not compatible_calibrations,
+            )
+
+        metric_row([
+            ("Exercise", exercise),
+            ("Side", side),
+            ("Weight", weight),
+            ("Planned reps", expected_reps),
+        ])
+        if comparison_target:
+            st.info(f"Comparison target: {comparison_target}")
+
+        if not submitted:
+            return
+
+        DATA_DIR.mkdir(exist_ok=True)
+        spec = build_workout_session_spec(source_type, port, replay_csv, replay_realtime)
+        st.session_state.workout_set_countdown_started_at = lifecycle.begin_session(spec)
+        st.rerun()
+        return
+
+    if lifecycle.state == SetState.COUNTDOWN:
+        spec = lifecycle.active_spec
+        if spec is None:
+            lifecycle.fail("Set session was not initialized.")
+            st.rerun()
+
+        started_at = st.session_state.get("workout_set_countdown_started_at", time.monotonic())
+        remaining = max(0, 3 - int(time.monotonic() - started_at))
+        if remaining > 0:
+            st.warning(f"Recording begins in {remaining}")
+            if st.button("Cancel Set", key="workout_cancel_countdown"):
+                lifecycle.cancel()
+                st.rerun()
+            time.sleep(0.25)
+            st.rerun()
+
+        calibration, _ = load_compatible_current_calibration(
+            spec.metadata.get("muscle", ""),
+            spec.metadata.get("side", ""),
+            spec.metadata.get("calibration_setup_id", ""),
+        )
+        if calibration is None:
+            lifecycle.fail(
+                "A compatible calibration for this muscle and side is required before recording."
+            )
+            st.rerun()
+
+        source = source_from_selection(
+            spec.source_type,
+            port=spec.port,
+            replay_csv=spec.replay_csv,
+            replay_realtime=spec.replay_realtime,
+        )
+        try:
+            source.connect()
+        except Exception as error:  # noqa: BLE001
+            lifecycle.fail(error)
+            st.rerun()
+
+        lifecycle.start_recording(calibration=calibration)
+        lifecycle.remember_source_object(source)
+        st.session_state.workout_set_source = source
+        metadata = dict(spec.metadata)
+        metadata["timestamp"] = lifecycle.started_at
+        metadata["calibration_csv"] = (calibration or {}).get("source_csv", "")
+        st.session_state.workout_set_metadata = metadata
+        st.rerun()
+
+    if lifecycle.state in (SetState.RECORDING, SetState.POSSIBLE_END):
+        source = st.session_state.get("workout_set_source")
+        if source is None:
+            lifecycle.fail("Signal source was not available during recording.")
+            st.rerun()
+        render_live_recording_controls(lifecycle, source)
+        return
+
+    if lifecycle.state == SetState.ANALYZING:
+        st.info("Analyzing completed set...")
+        metadata = st.session_state.get("workout_set_metadata", {})
+        try:
+            result = analyze_completed_set_once(lifecycle, metadata)
+        except Exception as error:  # noqa: BLE001
+            lifecycle.fail(error)
+            st.rerun()
+
+        st.session_state.latest_recorded_csv = result["csv_file"]
+        lifecycle.mark_results(result)
+        st.rerun()
+
+    if lifecycle.state == SetState.RESULTS:
+        render_completed_set_results(lifecycle)
+        return
+
+    if lifecycle.state == SetState.CANCELLED:
+        st.warning(lifecycle.cancelled_reason or "Set was cancelled. No analysis was run.")
+        if st.button("Start Next Set", key="workout_reset_cancelled"):
+            close_workout_source()
+            lifecycle.reset()
+            clear_replay_metadata_source_marker(st.session_state)
+            st.rerun()
+        return
+
+    if lifecycle.state == SetState.ERROR:
+        st.error(lifecycle.error_message)
+        if st.button("Reset Set Flow", key="workout_reset_error"):
+            close_workout_source()
+            lifecycle.reset()
+            clear_replay_metadata_source_marker(st.session_state)
+            st.rerun()
 
 
 def show_workout_session():
-    current_source_type = st.session_state.get("workout_signal_source", "Serial hardware")
-    confirmed = True
-
-    if current_source_type == "Serial hardware":
-        confirmed = show_preflight()
-
+    confirmed = show_preflight()
     source_type, port, replay_csv, replay_realtime = show_source_controls(confirmed)
-
-    if source_type == "Replay CSV":
-        show_replay_workflow(replay_csv, replay_realtime)
-        return
-
     show_signal_check(confirmed, source_type, port, replay_csv, replay_realtime)
     show_workout_recording(confirmed, source_type, port, replay_csv, replay_realtime)
 
@@ -1435,15 +1879,492 @@ def show_weight_ladder():
         st.caption("Interpret this as EMG signal behavior only; it is not a strength or exercise-quality score.")
 
 
+def dataset_source_controls():
+    source_type = st.radio(
+        "Signal source",
+        ["Serial hardware", "Replay CSV"],
+        horizontal=True,
+        key="dataset_signal_source",
+    )
+    port = None
+    replay_csv = None
+    replay_realtime = False
+
+    if source_type == "Serial hardware":
+        ports = available_serial_ports()
+
+        if not ports:
+            st.warning("No serial ports detected.")
+        else:
+            options = [f"{port_info['device']} - {port_info['description']}" for port_info in ports]
+            selected = st.selectbox("Detected serial ports", options, key="dataset_serial_port")
+            port = selected.split(" - ", 1)[0]
+    else:
+        replay_files = valid_workout_recordings()
+
+        if replay_files:
+            selected_name = st.selectbox(
+                "Replay recording",
+                [file.name for file in replay_files],
+                key="dataset_replay_recording",
+            )
+            replay_csv = next(file for file in replay_files if file.name == selected_name)
+            replay_realtime = st.checkbox(
+                "Replay with original timing during cue preview",
+                key="dataset_replay_realtime",
+            )
+        else:
+            st.warning("No valid workout CSVs are available for replay.")
+
+    return source_type, port, replay_csv, replay_realtime
+
+
+def dataset_collection_metadata():
+    st.subheader("Session Metadata")
+    col_a, col_b, col_c = st.columns(3)
+
+    with col_a:
+        participant_id = st.text_input("Pseudonymous participant ID", key="dataset_participant")
+        exercise = st.text_input("Exercise", value="bicep curl", key="dataset_exercise")
+        muscle = st.text_input("Muscle", value="bicep", key="dataset_muscle")
+        side = st.selectbox("Side", ["right", "left"], key="dataset_side")
+
+    with col_b:
+        weight = st.text_input("Weight", key="dataset_weight")
+        planned_reps = st.number_input(
+            "Planned repetitions",
+            min_value=1,
+            max_value=100,
+            value=6,
+            step=1,
+            key="dataset_planned_reps",
+        )
+        body_position = st.text_input("Body position", value="seated", key="dataset_body_position")
+        grip = st.text_input("Grip", value="supinated", key="dataset_grip")
+
+    with col_c:
+        placement_id = st.text_input("Placement ID", key="dataset_placement_id")
+        calibration_setup_id = st.text_input("Sensor setup ID", key="dataset_calibration_setup_id")
+        calibration_options = csv_options(
+            compatible_calibration_recordings(muscle, side, calibration_setup_id)
+            if calibration_setup_id.strip()
+            else calibration_recordings()
+        )
+        calibration_csv = st.selectbox(
+            "Calibration CSV",
+            calibration_options,
+            key="dataset_calibration_csv",
+        )
+        notes = st.text_area("Session notes", key="dataset_notes")
+
+    if not calibration_setup_id.strip():
+        st.warning(
+            "Set a sensor setup ID and record a new calibration whenever MyoWare ENV gain or electrode setup changes."
+        )
+
+    st.subheader("Planned Cadence")
+    cadence_cols = st.columns(4)
+    cadence = {
+        "seconds_up": cadence_cols[0].number_input("Seconds up", min_value=0.1, value=1.0, step=0.1),
+        "hold_seconds": cadence_cols[1].number_input("Optional hold", min_value=0.0, value=0.0, step=0.1),
+        "seconds_down": cadence_cols[2].number_input("Seconds down", min_value=0.1, value=2.0, step=0.1),
+        "bottom_rest_seconds": cadence_cols[3].number_input("Bottom rest", min_value=0.0, value=1.0, step=0.1),
+    }
+
+    return {
+        "participant_id": participant_id.strip(),
+        "exercise": exercise.strip(),
+        "muscle": muscle.strip(),
+        "side": side,
+        "weight": weight.strip(),
+        "planned_reps": int(planned_reps),
+        "body_position": body_position.strip(),
+        "grip": grip.strip(),
+        "placement_id": placement_id.strip(),
+        "calibration_csv": calibration_csv,
+        "calibration_setup_id": calibration_setup_id.strip(),
+        "notes": notes.strip(),
+        "cadence": cadence,
+    }
+
+
+def build_dataset_manifest(session_metadata, recording_csv, cue_schedule, recording_started_at):
+    created_at = datetime.now()
+    session_id = new_session_id(
+        session_metadata["participant_id"],
+        session_metadata["exercise"],
+        created_at=created_at,
+    )
+    exercise_metadata = {
+        "exercise": session_metadata["exercise"],
+        "muscle": session_metadata["muscle"],
+        "side": session_metadata["side"],
+        "weight": session_metadata["weight"],
+        "body_position": session_metadata["body_position"],
+        "grip": session_metadata["grip"],
+        "placement_id": session_metadata["placement_id"],
+        "calibration_setup_id": session_metadata["calibration_setup_id"],
+    }
+    calibration_csv = selected_csv(session_metadata["calibration_csv"])
+    return create_session_manifest(
+        session_id=session_id,
+        participant_id=session_metadata["participant_id"],
+        recording_csv=recording_csv,
+        calibration_csv=calibration_csv,
+        exercise_metadata=exercise_metadata,
+        planned_reps=session_metadata["planned_reps"],
+        cadence=session_metadata["cadence"],
+        cue_timestamps=cue_schedule,
+        recording_started_at=recording_started_at,
+        notes=session_metadata["notes"],
+    )
+
+
+def show_dataset_collection():
+    st.header("Dataset Builder")
+    st.caption(
+        "Collect cue-assisted recordings and create manifests for later human labeling. "
+        "Planned cues are stored as timing cues only, not as verified rep boundaries."
+    )
+    source_type, port, replay_csv, replay_realtime = dataset_source_controls()
+    session_metadata = dataset_collection_metadata()
+    cue_schedule = planned_cue_schedule(session_metadata["planned_reps"], session_metadata["cadence"])
+    duration_seconds = planned_total_duration(session_metadata["planned_reps"], session_metadata["cadence"])
+
+    metric_row([
+        ("Planned duration", f"{duration_seconds:.1f}s"),
+        ("Planned reps", session_metadata["planned_reps"]),
+        ("Cue count", len(cue_schedule)),
+    ])
+
+    with st.expander("Cue schedule"):
+        st.table(cue_schedule)
+
+    missing_participant = not session_metadata["participant_id"]
+    missing_source = source_type == "Serial hardware" and port is None
+    missing_source = missing_source or (source_type == "Replay CSV" and replay_csv is None)
+
+    if missing_participant:
+        st.warning("Use a pseudonymous participant ID. Do not enter names or contact details.")
+
+    if source_type == "Replay CSV":
+        if st.button(
+            "Create Dataset Session From Replay",
+            disabled=missing_participant or missing_source,
+            key="dataset_create_replay_session",
+        ):
+            try:
+                manifest = build_dataset_manifest(
+                    session_metadata,
+                    replay_csv,
+                    cue_schedule,
+                    recording_started_at="replay_existing_csv",
+                )
+                manifest_file, annotation_file = save_dataset_session(manifest)
+            except Exception as error:  # noqa: BLE001
+                st.error(f"Dataset session creation failed: {error}")
+                return
+
+            st.success(f"Saved dataset session: {manifest['session_id']}")
+            st.write(f"Manifest: {manifest_file.resolve()}")
+            st.write(f"Annotations: {annotation_file.resolve()}")
+        return
+
+    if not st.button(
+        "Start Cue-Assisted Recording",
+        disabled=missing_participant or missing_source,
+        key="dataset_start_recording",
+    ):
+        return
+
+    countdown = st.empty()
+    for seconds_remaining in range(3, 0, -1):
+        countdown.warning(f"Recording begins in {seconds_remaining}")
+        time.sleep(1)
+    countdown.success("Recording started")
+
+    DATA_DIR.mkdir(exist_ok=True)
+    timestamp = datetime.now()
+    output_file = unique_recording_path(session_metadata["exercise"], timestamp)
+    metadata = {
+        "exercise_name": session_metadata["exercise"],
+        "muscle": session_metadata["muscle"],
+        "side": session_metadata["side"],
+        "weight": session_metadata["weight"],
+        "expected_reps": "",
+        "planned_reps": str(session_metadata["planned_reps"]),
+        "data_type": "real",
+        "test_type": "dataset_collection",
+        "notes": session_metadata["notes"],
+        "csv_filename": output_file.name,
+        "timestamp": timestamp.isoformat(timespec="seconds"),
+    }
+    source = source_from_selection(source_type, port, None, False)
+    progress_bar = st.progress(0.0)
+
+    try:
+        recording = write_dataset_recording(
+            source,
+            output_file,
+            metadata,
+            duration_seconds,
+            cue_schedule,
+            progress_bar,
+        )
+    except Exception as error:  # noqa: BLE001
+        st.error(f"Recording failed: {error}")
+        return
+
+    if recording["malformed_reads"]:
+        st.warning(f"Skipped {recording['malformed_reads']} malformed or empty readings.")
+
+    if not recording["readings"]:
+        st.error("No valid readings were saved, so the dataset session was not created.")
+        return
+
+    try:
+        manifest = build_dataset_manifest(
+            session_metadata,
+            output_file,
+            cue_schedule,
+            recording_started_at=timestamp.isoformat(timespec="seconds"),
+        )
+        manifest_file, annotation_file = save_dataset_session(manifest)
+    except Exception as error:  # noqa: BLE001
+        st.error(f"Dataset session creation failed: {error}")
+        return
+
+    st.success(f"Saved dataset session: {manifest['session_id']}")
+    st.write(f"Raw recording: {output_file.resolve()}")
+    st.write(f"Manifest: {manifest_file.resolve()}")
+    st.write(f"Annotations: {annotation_file.resolve()}")
+
+
+def session_label(session):
+    metadata = session.get("exercise_metadata", {})
+    return (
+        f"{session.get('created_at', '')} - {session.get('participant_id', '')} - "
+        f"{metadata.get('exercise', '')} - {session.get('session_id', '')}"
+    )
+
+
+def default_annotation_rows(annotations):
+    rows = [
+        {
+            "rep_number": interval.get("rep_number", index),
+            "start_time": interval.get("start_time", 0.0),
+            "end_time": interval.get("end_time", 0.0),
+            "confidence": interval.get("confidence", ""),
+            "note": interval.get("note", ""),
+        }
+        for index, interval in enumerate(annotations.get("verified_rep_intervals", []), start=1)
+    ]
+
+    return rows or [{
+        "rep_number": 1,
+        "start_time": 0.0,
+        "end_time": 0.0,
+        "confidence": "",
+        "note": "",
+    }]
+
+
+def default_false_interval_rows(annotations):
+    rows = [
+        {
+            "start_time": interval.get("start_time", 0.0),
+            "end_time": interval.get("end_time", 0.0),
+            "confidence": interval.get("confidence", ""),
+            "note": interval.get("note", ""),
+        }
+        for interval in annotations.get("excluded_false_intervals", [])
+    ]
+
+    return rows or [{
+        "start_time": 0.0,
+        "end_time": 0.0,
+        "confidence": "",
+        "note": "",
+    }]
+
+
+def remove_blank_editor_rows(rows):
+    cleaned = []
+
+    for row in rows:
+        start_time = row.get("start_time", 0)
+        end_time = row.get("end_time", 0)
+        confidence = row.get("confidence", "")
+        note = row.get("note", "")
+
+        if (
+            start_time in ("", 0, 0.0, None)
+            and end_time in ("", 0, 0.0, None)
+            and confidence in ("", None)
+            and note in ("", None)
+        ):
+            continue
+
+        cleaned.append(row)
+
+    return cleaned
+
+
+def show_dataset_annotation():
+    st.header("Annotate Dataset Session")
+    sessions = list_dataset_sessions()
+
+    if not sessions:
+        st.info("No dataset sessions have been created yet.")
+        return
+
+    labels = [session_label(session) for session in sessions]
+    selected_label = st.selectbox("Dataset session", labels, key="dataset_annotation_session")
+    manifest = sessions[labels.index(selected_label)]
+    annotations = load_annotations(manifest["session_id"])
+    csv_file = resolve_repo_path(manifest["recording_csv"])
+
+    if annotations.get("annotation_status") == "locked":
+        st.warning("This annotation is locked. Unlock it in the JSON file only if you intentionally need to revise it.")
+
+    metric_row([
+        ("Session ID", manifest["session_id"]),
+        ("Planned reps", manifest.get("planned_reps", "")),
+        ("Actual reps", annotations.get("actual_reps") or "Not set"),
+        ("Status", annotations.get("annotation_status", "unreviewed")),
+    ])
+
+    try:
+        figure = annotation_figure(manifest, annotations)
+        st.pyplot(figure)
+        plt.close(figure)
+    except Exception as error:  # noqa: BLE001
+        st.error(f"Could not render annotation plot: {error}")
+
+    st.subheader("Verified Repetitions")
+    edited_rows = st.data_editor(
+        default_annotation_rows(annotations),
+        num_rows="dynamic",
+        disabled=annotations.get("annotation_status") == "locked",
+        key=f"dataset_rep_editor_{manifest['session_id']}",
+    )
+
+    st.subheader("False Detector Intervals")
+    default_false_rows = default_false_interval_rows(annotations)
+    false_rows = st.data_editor(
+        default_false_rows,
+        num_rows="dynamic",
+        disabled=annotations.get("annotation_status") == "locked",
+        key=f"dataset_false_editor_{manifest['session_id']}",
+    )
+
+    status = st.selectbox(
+        "Annotation status",
+        ["unreviewed", "reviewed", "locked"],
+        index=["unreviewed", "reviewed", "locked"].index(
+            annotations.get("annotation_status", "unreviewed")
+        ),
+        disabled=annotations.get("annotation_status") == "locked",
+        key=f"dataset_annotation_status_{manifest['session_id']}",
+    )
+    actual_reps = st.number_input(
+        "Actual reps (optional)",
+        min_value=0,
+        value=int(annotations.get("actual_reps") or 0),
+        step=1,
+        disabled=annotations.get("annotation_status") == "locked",
+        key=f"dataset_actual_reps_{manifest['session_id']}",
+    )
+    actual_reps_is_set = st.checkbox(
+        "Store actual reps value",
+        value=annotations.get("actual_reps") is not None,
+        disabled=annotations.get("annotation_status") == "locked",
+        key=f"dataset_actual_reps_is_set_{manifest['session_id']}",
+    )
+    confidence = st.slider(
+        "Overall confidence",
+        min_value=0.0,
+        max_value=1.0,
+        value=float(annotations.get("confidence") or 0.0),
+        step=0.05,
+        disabled=annotations.get("annotation_status") == "locked",
+        key=f"dataset_confidence_{manifest['session_id']}",
+    )
+    notes = st.text_area(
+        "Annotation notes",
+        value=annotations.get("notes", ""),
+        disabled=annotations.get("annotation_status") == "locked",
+        key=f"dataset_annotation_notes_{manifest['session_id']}",
+    )
+
+    if not st.button(
+        "Save Annotations",
+        disabled=annotations.get("annotation_status") == "locked",
+        key=f"dataset_save_annotations_{manifest['session_id']}",
+    ):
+        return
+
+    try:
+        max_time = recording_duration(csv_file)
+        errors, normalized_rows = validate_annotation_rows(
+            remove_blank_editor_rows(edited_rows),
+            max_time,
+        )
+        false_errors, normalized_false_rows = validate_annotation_rows(
+            remove_blank_editor_rows(false_rows),
+            max_time,
+            require_rep_numbers=False,
+        )
+    except Exception as error:  # noqa: BLE001
+        st.error(f"Validation failed: {error}")
+        return
+
+    errors.extend(error.replace("Rep", "False interval") for error in false_errors)
+
+    if errors:
+        for error in errors:
+            st.error(error)
+        return
+
+    updated = {
+        "schema_version": annotations.get("schema_version", "boundary_annotations_v1"),
+        "annotation_status": status,
+        "actual_reps": actual_reps if actual_reps_is_set else None,
+        "verified_rep_intervals": normalized_rows,
+        "excluded_false_intervals": normalized_false_rows,
+        "confidence": confidence,
+        "notes": notes,
+        "last_modified": annotations.get("last_modified", ""),
+    }
+    try:
+        annotation_file = save_annotations(manifest["session_id"], updated)
+    except Exception as error:  # noqa: BLE001
+        st.error(f"Annotations were not saved: {error}")
+        return
+
+    st.success(f"Saved annotations: {annotation_file.resolve()}")
+
+
+def show_dataset_builder():
+    collection_tab, annotation_tab = st.tabs(["Collection", "Annotation"])
+
+    with collection_tab:
+        show_dataset_collection()
+
+    with annotation_tab:
+        show_dataset_annotation()
+
+
 def main():
     st.set_page_config(page_title="RepAI", layout="wide")
     st.title("RepAI")
 
-    overview_tab, session_tab, side_tab, ladder_tab = st.tabs([
+    overview_tab, session_tab, side_tab, ladder_tab, dataset_tab = st.tabs([
         "Overview",
         "Workout Session",
         "Side Comparison",
         "Weight Ladder",
+        "Dataset Builder",
     ])
 
     with overview_tab:
@@ -1460,6 +2381,9 @@ def main():
 
     with ladder_tab:
         show_weight_ladder()
+
+    with dataset_tab:
+        show_dataset_builder()
 
 
 if __name__ == "__main__":

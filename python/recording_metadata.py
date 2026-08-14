@@ -49,6 +49,7 @@ def metadata_lines(metadata):
         "side": "Side",
         "weight": "Weight",
         "expected_reps": "Expected reps",
+        "calibration_setup_id": "Calibration setup ID",
         "data_type": "Data type",
         "test_type": "Test type",
         "notes": "Notes",

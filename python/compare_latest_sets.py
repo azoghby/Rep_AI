@@ -1,19 +1,16 @@
 import matplotlib.pyplot as plt
 
-from calibration_utils import load_latest_calibration, normalize_values
+from calibration_utils import load_calibration_for_recording, normalize_values
 from detect_reps import (
-    BASELINE_PERCENTILE,
     DATA_DIR,
-    END_THRESHOLD_FRACTION,
     GRAPHS_DIR,
     SMOOTHING_WINDOW,
-    START_THRESHOLD_FRACTION,
     SUMMARIES_DIR,
     activation_change_phrase,
     average,
     average_rep_peak,
     detect_reps,
-    low_percentile_average,
+    detector_threshold_values,
     moving_average,
     read_signal,
     rep_average_activation,
@@ -153,11 +150,9 @@ def analyze_set(csv_file, calibration=None):
     times, values = read_signal(csv_file)
     smoothed_values = moving_average(values, SMOOTHING_WINDOW)
 
-    baseline = low_percentile_average(smoothed_values, BASELINE_PERCENTILE)
-    max_signal = max(smoothed_values)
-    signal_range = max_signal - baseline
-    start_threshold = baseline + START_THRESHOLD_FRACTION * signal_range
-    end_threshold = baseline + END_THRESHOLD_FRACTION * signal_range
+    thresholds = detector_threshold_values(times, smoothed_values, values)
+    start_threshold = thresholds["start_threshold"]
+    end_threshold = thresholds["end_threshold"]
 
     reps = detect_reps(
         times,
@@ -692,7 +687,10 @@ def save_graph(set_1, set_2):
 
 def main():
     set_files = automatic_comparison_csv_files(DATA_DIR)
-    calibration = load_latest_calibration()
+    calibration = (
+        load_calibration_for_recording(set_files[1])
+        or load_calibration_for_recording(set_files[0])
+    )
     set_1 = analyze_set(set_files[0], calibration)
     set_2 = analyze_set(set_files[1], calibration)
     comparison = comparison_summary(set_1, set_2)

@@ -1,3 +1,4 @@
 matplotlib
 pyserial
+scikit-learn
 streamlit

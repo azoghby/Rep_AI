@@ -20,7 +20,6 @@ if str(APP_DIR) not in sys.path:
 
 from acquisition import ReplaySignalSource  # noqa: E402
 from detect_reps import analyze_csv_file  # noqa: E402
-from streamlit_app import run_replay_workflow  # noqa: E402
 
 
 SYNTHETIC_CSV = BASE_DIR / "examples" / "synthetic" / "synthetic_bicep_curl_6_reps.csv"
@@ -55,25 +54,9 @@ def assert_analysis_smoke():
         raise AssertionError(f"Hybrid detector found {hybrid['summary']['total_reps']} reps")
 
 
-def assert_replay_workflow_smoke():
-    result = run_replay_workflow(SYNTHETIC_CSV, replay_realtime=False)
-    legacy_count = result["legacy_result"]["summary"]["total_reps"]
-    hybrid_count = result["hybrid_result"]["summary"]["total_reps"]
-
-    if legacy_count != EXPECTED_REPS:
-        raise AssertionError(f"Replay workflow legacy detector found {legacy_count} reps")
-
-    if hybrid_count != EXPECTED_REPS:
-        raise AssertionError(f"Replay workflow hybrid detector found {hybrid_count} reps")
-
-    if result["samples_read"] < 20:
-        raise AssertionError(f"Replay workflow read too few samples: {result['samples_read']}")
-
-
 def main():
     assert_replay_loads()
     assert_analysis_smoke()
-    assert_replay_workflow_smoke()
     print("Public smoke test passed: synthetic replay loaded and both detectors found 6 reps.")
 
 

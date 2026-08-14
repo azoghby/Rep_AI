@@ -4,7 +4,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 
-from calibration_utils import load_latest_calibration, normalize_values
+from calibration_utils import load_calibration_for_recording, normalize_values
 from recording_metadata import load_metadata, metadata_lines
 
 
@@ -28,10 +28,16 @@ HYBRID_MIN_SPLITTABLE_REGION_SECONDS = 5.0
 HYBRID_MIN_ABSOLUTE_DROP = 300
 HYBRID_MIN_LOCAL_RANGE_DROP_FRACTION = 0.25
 HYBRID_MIN_ADJACENT_PEAK_DROP_FRACTION = 0.30
+HYBRID_STRONG_RELATIVE_DROP_FRACTION = 0.80
+HYBRID_STRONG_LOCAL_DROP_FRACTION = 0.65
+HYBRID_STRONG_RELATIVE_VALLEY_DURATION_SECONDS = 1.0
 HYBRID_VALLEY_CLUSTER_SECONDS = 0.30
 HYBRID_PLATEAU_FRACTION = 0.05
 HYBRID_MIN_REP_PEAK_EXCESS_FRACTION = 0.08
 HYBRID_MIN_REP_AREA_FRACTION_SECONDS = 0.06
+INITIAL_TRANSIENT_DURATION_MEDIAN_FRACTION = 0.55
+INITIAL_TRANSIENT_AREA_MEDIAN_FRACTION = 0.35
+INITIAL_TRANSIENT_PEAK_EXCESS_MEDIAN_FRACTION = 0.55
 HYBRID_INITIAL_LULL_SECONDS = 0.25
 HYBRID_INITIAL_SUBSTANTIAL_RISE_FRACTION = 0.50
 HYBRID_SHORT_FRAGMENT_MEDIAN_FRACTION = 0.55
@@ -105,6 +111,115 @@ def low_percentile_average(values, percentile):
     return sum(low_values) / len(low_values)
 
 
+def detector_threshold_values(times, smoothed_values, raw_values=None):
+    if not smoothed_values:
+        raise ValueError("Cannot calculate detector thresholds without signal values.")
+
+    full_thresholds = threshold_values_for_reference(times, smoothed_values, smoothed_values)
+    reference_values = threshold_reference_values(times, smoothed_values)
+    active_thresholds = threshold_values_for_reference(times, smoothed_values, reference_values)
+
+    if len(reference_values) == len(smoothed_values) or raw_values is None:
+        return active_thresholds
+
+    raw_values = raw_values or smoothed_values
+    full_reps, _ = detect_reps_hybrid(
+        times,
+        raw_values,
+        smoothed_values,
+        full_thresholds["start_threshold"],
+        full_thresholds["end_threshold"],
+    )
+    active_reps, _ = detect_reps_hybrid(
+        times,
+        raw_values,
+        smoothed_values,
+        active_thresholds["start_threshold"],
+        active_thresholds["end_threshold"],
+    )
+    full_legacy_reps = detect_reps(
+        times,
+        raw_values,
+        smoothed_values,
+        full_thresholds["start_threshold"],
+        full_thresholds["end_threshold"],
+    )
+    active_legacy_reps = detect_reps(
+        times,
+        raw_values,
+        smoothed_values,
+        active_thresholds["start_threshold"],
+        active_thresholds["end_threshold"],
+    )
+
+    if (
+        len(active_reps) <= len(full_reps)
+        and len(active_legacy_reps) <= len(full_legacy_reps)
+    ):
+        return full_thresholds
+
+    full_first_start = full_reps[0]["start_time"] if full_reps else None
+    active_first_start = active_reps[0]["start_time"] if active_reps else None
+
+    if (
+        full_first_start is not None
+        and active_first_start is not None
+        and active_first_start < full_first_start - HYBRID_INITIAL_LULL_SECONDS
+    ):
+        return full_thresholds
+
+    return active_thresholds
+
+
+def threshold_values_for_reference(times, smoothed_values, reference_values):
+    baseline = low_percentile_average(reference_values, BASELINE_PERCENTILE)
+    max_signal = max(reference_values)
+    signal_range = max_signal - baseline
+    start_threshold = baseline + START_THRESHOLD_FRACTION * signal_range
+    end_threshold = baseline + END_THRESHOLD_FRACTION * signal_range
+
+    return {
+        "baseline": baseline,
+        "max_signal": max_signal,
+        "signal_range": signal_range,
+        "start_threshold": start_threshold,
+        "end_threshold": end_threshold,
+        "reference_sample_count": len(reference_values),
+        "reference_end_time": times[len(reference_values) - 1] if times else None,
+    }
+
+
+def threshold_reference_values(times, smoothed_values):
+    """Use the active prefix for threshold estimation, excluding trailing quiet.
+
+    The detector still runs over the full signal. This only prevents appended
+    post-set inactivity from lowering the low-percentile baseline and merging
+    already-finished reps.
+    """
+    if not smoothed_values:
+        return []
+
+    baseline = low_percentile_average(smoothed_values, BASELINE_PERCENTILE)
+    max_signal = max(smoothed_values)
+    signal_range = max_signal - baseline
+
+    if signal_range <= 0:
+        return smoothed_values
+
+    preliminary_end_threshold = baseline + END_THRESHOLD_FRACTION * signal_range
+    last_active_index = None
+
+    for index in range(len(smoothed_values) - 1, -1, -1):
+        if smoothed_values[index] > preliminary_end_threshold:
+            last_active_index = index
+            break
+
+    if last_active_index is None:
+        return smoothed_values
+
+    return smoothed_values[:last_active_index + 1]
+
+
 def detect_reps(times, raw_values, smoothed_values, start_threshold, end_threshold):
     reps = []
     in_rep = False
@@ -172,7 +287,12 @@ def detect_reps(times, raw_values, smoothed_values, start_threshold, end_thresho
         if duration >= MIN_REP_DURATION_SECONDS:
             reps.append(current_rep)
 
-    return reps
+    return reject_initial_transient_reps(
+        times,
+        smoothed_values,
+        reps,
+        start_threshold,
+    )
 
 
 def index_at_or_after(times, target_time):
@@ -208,6 +328,73 @@ def rep_from_indices(times, raw_values, start_index, end_index):
         "peak_time": times[peak_index],
         "values": values,
     }
+
+
+def rep_index_bounds(times, rep):
+    return (
+        index_at_or_after(times, rep["start_time"]),
+        index_at_or_after(times, rep["end_time"]),
+    )
+
+
+def rep_contraction_evidence(times, smoothed_values, rep, start_threshold):
+    start_index, end_index = rep_index_bounds(times, rep)
+    quality = rep_signal_quality(
+        times,
+        smoothed_values,
+        start_index,
+        end_index,
+        start_threshold,
+        max(1, max(smoothed_values) - start_threshold),
+    )
+    evidence = segment_contraction_evidence(
+        times,
+        smoothed_values,
+        start_index,
+        end_index,
+        start_threshold,
+    )
+    evidence["peak_excess"] = quality["peak_excess"]
+    evidence["area_above_start"] = quality["area_above_start"]
+    return evidence
+
+
+def weak_initial_transient(first_evidence, later_evidence):
+    if not later_evidence:
+        return False
+
+    typical_duration = median([evidence["duration"] for evidence in later_evidence])
+    typical_area = median([evidence["area_above_start"] for evidence in later_evidence])
+    typical_peak_excess = median([evidence["peak_excess"] for evidence in later_evidence])
+
+    return (
+        typical_duration > 0
+        and typical_area > 0
+        and typical_peak_excess > 0
+        and first_evidence["duration"] < typical_duration * INITIAL_TRANSIENT_DURATION_MEDIAN_FRACTION
+        and first_evidence["area_above_start"] < typical_area * INITIAL_TRANSIENT_AREA_MEDIAN_FRACTION
+        and first_evidence["peak_excess"] < typical_peak_excess * INITIAL_TRANSIENT_PEAK_EXCESS_MEDIAN_FRACTION
+    )
+
+
+def reject_initial_transient_reps(times, smoothed_values, reps, start_threshold):
+    if len(reps) < 2:
+        return reps
+
+    evidence = [
+        rep_contraction_evidence(
+            times,
+            smoothed_values,
+            rep,
+            start_threshold,
+        )
+        for rep in reps
+    ]
+
+    if weak_initial_transient(evidence[0], evidence[1:]):
+        return reps[1:]
+
+    return reps
 
 
 def rep_signal_quality(times, smoothed_values, start_index, end_index, start_threshold, active_range):
@@ -846,6 +1033,11 @@ def evaluate_split_candidate(times, smoothed_values, start_index, end_index, val
         HYBRID_MIN_ABSOLUTE_DROP,
         local_range * HYBRID_MIN_LOCAL_RANGE_DROP_FRACTION,
     )
+    strong_relative_drop = (
+        normalized_adjacent_drop >= HYBRID_STRONG_RELATIVE_DROP_FRACTION
+        and normalized_local_drop >= HYBRID_STRONG_LOCAL_DROP_FRACTION
+        and low_duration >= HYBRID_STRONG_RELATIVE_VALLEY_DURATION_SECONDS
+    )
     reasons = []
 
     if segment_duration < HYBRID_MIN_SPLITTABLE_REGION_SECONDS:
@@ -860,7 +1052,7 @@ def evaluate_split_candidate(times, smoothed_values, start_index, end_index, val
     if left_peak < start_threshold or right_peak < start_threshold:
         reasons.append("adjacent contraction peak below start threshold")
 
-    if adjacent_drop < min_drop:
+    if adjacent_drop < min_drop and not strong_relative_drop:
         reasons.append("valley drop too small")
 
     if normalized_adjacent_drop < HYBRID_MIN_ADJACENT_PEAK_DROP_FRACTION:
@@ -1489,15 +1681,15 @@ def plot_reps(
 def analyze_csv_file(csv_file, show_plot=True, method="legacy"):
     csv_file = Path(csv_file)
     metadata = load_metadata(csv_file)
-    calibration = load_latest_calibration()
+    calibration = load_calibration_for_recording(csv_file, metadata)
     times, values = read_signal(csv_file)
     smoothed_values = moving_average(values, SMOOTHING_WINDOW)
 
-    baseline = low_percentile_average(smoothed_values, BASELINE_PERCENTILE)
-    max_signal = max(smoothed_values)
-    signal_range = max_signal - baseline
-    start_threshold = baseline + START_THRESHOLD_FRACTION * signal_range
-    end_threshold = baseline + END_THRESHOLD_FRACTION * signal_range
+    thresholds = detector_threshold_values(times, smoothed_values, values)
+    baseline = thresholds["baseline"]
+    max_signal = thresholds["max_signal"]
+    start_threshold = thresholds["start_threshold"]
+    end_threshold = thresholds["end_threshold"]
 
     if method == "legacy":
         reps = detect_reps(

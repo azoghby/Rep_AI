@@ -2,9 +2,8 @@ from datetime import datetime
 from pathlib import Path
 
 from calibration_utils import (
-    LATEST_CALIBRATION_FILE,
-    calculate_calibration,
-    load_csv_signal,
+    build_latest_calibration_for_csv,
+    calibration_summary_lines,
     save_latest_calibration,
 )
 from recording_metadata import load_metadata
@@ -58,35 +57,21 @@ def latest_calibration_csv():
     return choose_csv_file()
 
 
-def calibration_lines(calibration):
-    return [
-        "Latest Calibration",
-        f"Source CSV: {calibration['source_csv']}",
-        f"Generated at: {calibration['generated_at']}",
-        f"Baseline average: {calibration['baseline']:.1f}",
-        f"Max flex value: {calibration['max_flex']:.1f}",
-        f"Signal range: {calibration['signal_range']:.1f}",
-        f"Low percentile: {calibration['low_percentile']}",
-        f"High percentile: {calibration['high_percentile']}",
-        f"Usable calibration: {'yes' if calibration['usable'] else 'no'}",
-    ]
-
-
 def main():
     csv_file = latest_calibration_csv()
-    _, values = load_csv_signal(csv_file)
-    calibration = calculate_calibration(values)
-    calibration["source_csv"] = csv_file.name
-    calibration["generated_at"] = datetime.now().isoformat(timespec="seconds")
+    calibration = build_latest_calibration_for_csv(
+        csv_file,
+        generated_at=datetime.now().isoformat(timespec="seconds"),
+    )
 
     calibration_file = save_latest_calibration(calibration)
     SUMMARIES_DIR.mkdir(exist_ok=True)
     CALIBRATION_SUMMARY_FILE.write_text(
-        "\n".join(calibration_lines(calibration)) + "\n",
+        "\n".join(calibration_summary_lines(calibration)) + "\n",
         encoding="utf-8",
     )
 
-    for line in calibration_lines(calibration):
+    for line in calibration_summary_lines(calibration):
         print(line)
 
     print(f"Saved calibration JSON to: {calibration_file.resolve()}")

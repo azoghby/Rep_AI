@@ -25,6 +25,11 @@ def read_text(path):
 
 
 def load_current_calibration():
+    calibration_files = calibration_recordings()
+
+    if calibration_files:
+        return load_calibration_from_csv_name(calibration_files[0].name)
+
     calibration_file = SUMMARIES_DIR / "latest_calibration.json"
 
     if not calibration_file.exists():
@@ -40,6 +45,54 @@ def load_current_calibration():
         source_metadata = load_metadata(DATA_DIR / source_csv)
 
     return calibration, source_metadata
+
+
+def normalized_metadata_value(value):
+    return str(value or "").strip().lower()
+
+
+def metadata_setup_id(metadata):
+    return normalized_metadata_value(
+        metadata.get("calibration_setup_id")
+        or metadata.get("sensor_setup_id")
+        or metadata.get("setup_id")
+    )
+
+
+def calibration_matches(metadata, muscle, side, setup_id=""):
+    required_muscle = normalized_metadata_value(muscle)
+    required_side = normalized_metadata_value(side)
+    required_setup_id = normalized_metadata_value(setup_id)
+    calibration_setup_id = metadata_setup_id(metadata)
+
+    if not required_muscle or not required_side:
+        return False
+
+    if calibration_setup_id != required_setup_id:
+        return False
+
+    return (
+        normalized_metadata_value(metadata.get("muscle")) == required_muscle
+        and normalized_metadata_value(metadata.get("side")) == required_side
+    )
+
+
+def compatible_calibration_recordings(muscle, side, setup_id=""):
+    return [
+        csv_file
+        for csv_file in calibration_recordings()
+        if calibration_matches(load_metadata(csv_file), muscle, side, setup_id)
+    ]
+
+
+def load_compatible_current_calibration(muscle, side, setup_id=""):
+    for csv_file in compatible_calibration_recordings(muscle, side, setup_id):
+        calibration, metadata = load_calibration_from_csv_name(csv_file.name)
+
+        if calibration is not None:
+            return calibration, metadata
+
+    return None, {}
 
 
 def metadata_marks_excluded(metadata):

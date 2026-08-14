@@ -18,14 +18,20 @@ __pycache__/
 
 data/*
 !data/.gitkeep
+datasets/*
+!datasets/.gitkeep
 graphs/*
 !graphs/.gitkeep
 summaries/*
 !summaries/.gitkeep
 reports/*
 !reports/.gitkeep
+artifacts/*
+!artifacts/.gitkeep
 app/protocol_sessions/*
 !app/protocol_sessions/.gitkeep
+.streamlit/secrets.toml
+.streamlit/config.toml
 
 calibration*.csv
 *_calibration*.csv
@@ -37,5 +43,12 @@ calibration*.csv
 latest_*.json
 latest_*.txt
 latest_*.png
+boundary_candidates.csv
+*.joblib
+*.pkl
+*.pickle
+*.onnx
+*.parquet
+*.feather
 tmp/
 temp/
